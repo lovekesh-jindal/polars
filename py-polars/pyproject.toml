@@ -286,6 +286,14 @@ filterwarnings = [
   "ignore:.*numpy\\.longdouble.*:UserWarning",
   # TODO: https://github.com/pola-rs/polars/issues/20065.
   "ignore:.*DataFrame Interchange Protocol is deprecated",
+  # Phase-1 deprecation cycle for ADBC
+  # `write_database` commit semantics.
+  # Existing tests intentionally exercise the
+  # caller-owned-connection path under the legacy
+  # default; the warning informs end users,
+  # not the suite.
+  "ignore:Polars currently auto-commits caller-owned "
+  "ADBC connections.*:DeprecationWarning"
 ]
 xfail_strict = true
 
