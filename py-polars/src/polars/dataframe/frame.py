@@ -72,6 +72,7 @@ from polars._utils.various import (
     NO_DEFAULT,
     _in_notebook,
     is_bool_sequence,
+    issue_warning,
     normalize_filepath,
     parse_version,
     qualified_type_name,
@@ -204,6 +205,40 @@ if TYPE_CHECKING:
 
     T = TypeVar("T")
     P = ParamSpec("P")
+
+
+def _adbc_autocommit_is_on(conn: Any) -> bool | None:
+    """
+    Best-effort introspection of an ADBC connection's autocommit setting.
+
+    Returns `True` or `False` only when the option can be
+    confidently read from the underlying driver; returns `None`
+    when introspection fails or yields an unexpected value
+    (some drivers do not expose the option).
+
+    The result is intended for warning-emission heuristics only,
+    never for altering commit policy.
+    """
+
+    try:
+        raw = conn.adbc_connection.get_option(
+            "adbc.connection.autocommit"
+        )
+    except Exception:
+        return None
+
+    if not isinstance(raw, str):
+        return None
+
+    val = raw.strip().lower()
+
+    if val == "true":
+        return True
+
+    if val == "false":
+        return False
+
+    return None
 
 
 class DataFrame:
@@ -4381,6 +4416,7 @@ class DataFrame:
         if_table_exists: DbWriteMode = "fail",
         engine: DbWriteEngine | None = None,
         engine_options: dict[str, Any] | None = None,
+        commit: bool | None = None,
     ) -> int:
         """
         Write the data in a Polars DataFrame to a database.
@@ -4388,6 +4424,18 @@ class DataFrame:
         .. versionadded:: 0.20.26
             Support for instantiated connection objects in addition to URI strings, and
             a new `engine_options` parameter.
+           
+        .. versionchanged:: 1.36.0
+            Added the `commit` parameter for `engine="adbc"`.
+            When `commit` is left as `None` and a caller-owned
+            connection object is supplied, the current behaviour
+            (auto-commit) is preserved but a `DeprecationWarning`
+            is emitted; in a future release this default will switch
+            to "do not commit", letting the caller manage the
+            transaction.
+            Pass `commit=True` to keep the legacy behaviour
+            explicitly, or `commit=False` to opt in to
+            caller-managed transactions immediately.    
 
         Parameters
         ----------
@@ -4420,6 +4468,32 @@ class DataFrame:
             * Setting `engine` to "adbc" inserts using the ADBC cursor's `adbc_ingest`
               method. Note that when passing an instantiated connection object, PyArrow
               is required for SQLite and Snowflake drivers.
+        commit
+          Whether Polars should commit the transaction after writing.
+          Only meaningful for `engine="adbc"`; ignored for
+         `engine="sqlalchemy"` (use the session/transaction
+          API of SQLAlchemy instead).
+
+          * `None` (default):
+             Commit if Polars opened the connection itself
+             (`connection` is a URI string).
+             When `connection` is a caller-supplied object,
+             the current behaviour is to commit and emit a
+            `DeprecationWarning`; a future release will stop
+             committing in this case so the caller can manage
+             the transaction.
+
+          * `True`:
+             Always commit. Use this to silence the deprecation
+             warning while keeping the legacy behaviour explicit.
+
+         * `False`:
+            Never commit. Use this when batching multiple
+            writes into a single transaction or when you want
+            to roll back on failure.
+            A `RuntimeWarning` is raised if the underlying
+            ADBC connection has autocommit enabled, since the
+            driver will commit each statement regardless.      
 
         Examples
         --------
@@ -4444,7 +4518,36 @@ class DataFrame:
         ...     table_name="target_table",
         ...     connection=engine,
         ... )  # doctest: +SKIP
+        Batch multiple ADBC writes into a single transaction by passing
+         `commit=False` and committing or rolling back yourself:
 
+        >>> import adbc_driver_postgresql.dbapi as pg  # doctest: +SKIP
+        >>> conn = pg.connect("postgresql://user:pass@server:port/database")  # doctest: +SKIP
+        >>> try:  # doctest: +SKIP
+        ...     df_a.write_database(
+        ...         "table_a",
+        ...         connection=conn,
+        ...         engine="adbc",
+        ...         commit=False,
+        ...     )
+        ...
+        ...     df_b.write_database(
+        ...         "table_b",
+        ...         connection=conn,
+        ...         engine="adbc",
+        ...         commit=False,
+        ...     )
+        ...
+        ...     conn.commit()
+        ...
+        ... except Exception:
+        ...     conn.rollback()
+        ...     raise
+        ...
+        ... finally:
+        ...     conn.close()
+        
+        
         Returns
         -------
         int
@@ -4497,6 +4600,38 @@ class DataFrame:
                     f"unrecognised connection type {qualified_type_name(connection)!r}"
                 )
                 raise TypeError(msg)
+            
+            # Resolve the effective commit policy.
+            # Phase 1: keep current behaviour (always commit on
+            # `commit=None) but emit a ``DeprecationWarning`
+            # for the caller-owned-connection case so users can
+            # migrate before the default flips to ownership-aware.
+
+            if commit is None:
+               should_commit = True
+               if not can_close_conn:
+                   issue_deprecation_warning(
+                      "Polars currently auto-commits caller-owned "
+                      "ADBC connections in 'write_database'. "
+                      "This default will change in a future release: "
+                      "caller-owned connections will no longer be "
+                      "committed automatically, allowing you to "
+                      "manage the transaction yourself. Pass "
+                      "'commit=True' to keep the current behaviour, "
+                      "or 'commit=False' to manage the transaction "
+                      "yourself.",
+                      version="1.36.0",
+        )
+            else:
+               should_commit = commit
+
+               if commit is False and _adbc_autocommit_is_on(conn) is True:
+                 issue_warning(
+                      "'commit=False' has no effect because the ADBC "
+                      "connection has autocommit enabled. Data will be "
+                      "committed automatically by the driver.",
+                      RuntimeWarning,
+                      )
 
             driver_manager_str_version = getattr(driver_manager, "__version__", "0.0")
             driver_manager_version = parse_version(driver_manager_str_version)
